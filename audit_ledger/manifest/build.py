@@ -15,11 +15,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime
 from typing import Iterable
 
 
 SCHEMA_VERSION = "1.0"
+
+# The manifest must only ingest date-prefixed daily entries. Non-date
+# prefixes (e.g. an ad-hoc test artifact at a ledger/<label>/... key) get
+# filtered out so the externally-published audit trail does not include
+# synthetic test data. Object Lock prevents cleanup of existing test
+# artifacts; the filter enforces the convention.
+_DATE_SUBPATH = re.compile(r"\d{4}-\d{2}-\d{2}/.+")
+
+
+def _is_date_prefixed(key: str, prefix: str) -> bool:
+    """True iff the key sits under <prefix><YYYY-MM-DD>/<file>."""
+    if not key.startswith(prefix):
+        return False
+    remainder = key[len(prefix):]
+    return bool(_DATE_SUBPATH.match(remainder))
 
 
 def canonical_bytes(manifest: dict) -> bytes:
@@ -38,12 +54,14 @@ def self_sha256(manifest: dict) -> str:
 
 def _list_prefix(s3_client, bucket: str, prefix: str) -> list[dict]:
     """Paginate every object under a prefix. Returns the raw S3 metadata
-    list — does not fetch bodies yet."""
+    list — does not fetch bodies yet. Filters out non-date-prefixed keys
+    (e.g. ad-hoc test artifacts) so the audit trail stays clean."""
     paginator = s3_client.get_paginator("list_objects_v2")
     out = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents") or []:
-            out.append(obj)
+            if _is_date_prefixed(obj["Key"], prefix):
+                out.append(obj)
     return out
 
 

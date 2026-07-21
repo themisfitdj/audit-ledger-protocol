@@ -35,6 +35,11 @@ class Origin(str, Enum):
 
 class Structure(str, Enum):
     BULL_PUT_SPREAD = "bull_put_spread"
+    BEAR_CALL_SPREAD = "bear_call_spread"
+    CALL_DEBIT_SPREAD = "call_debit_spread"
+    PUT_DEBIT_SPREAD = "put_debit_spread"
+    LONG_CALL = "long_call"
+    LONG_PUT = "long_put"
     IRON_CONDOR = "iron_condor"
     STRANGLE = "strangle"
     NAKED = "naked"
@@ -79,6 +84,13 @@ class ReconciledTrade:
     match_status: str
     roll_pair_id: str | None
     exceptions: list[dict]
+    # BRK-155: structure-aware tolerant-join provenance. ``match_classification``
+    # is exact / within_tolerance / loose_review (None when no rec matched).
+    # ``strike_deviation`` is realized_strike - suggested_strike per leg, in the
+    # structure's canonical leg order (None when no rec matched). loose_review
+    # is the operator-review flag — the fill is attributed, never dropped.
+    match_classification: str | None = None
+    strike_deviation: list[Decimal] | None = None
 
 
 @dataclass(frozen=True)
