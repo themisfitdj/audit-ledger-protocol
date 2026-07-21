@@ -273,3 +273,100 @@ def test_adapter_protocols_are_runtime_checkable():
     assert isinstance(FakeLedger(), LedgerSource)
     assert isinstance(FakePrice(), HistoricalPriceSource)
     assert isinstance(FakeRealized(), RealizedTradeSource)
+
+
+# ── v0.2.0 multi-strategy P&L modules ──────────────────────────────────────────
+
+def test_new_strategy_modules_import_and_export():
+    """The four non-bull-put structures resolve via the package __init__."""
+    from audit_ledger.strategies import (
+        long_put_pnl_at_expiry,
+        bear_call_spread_pnl_at_expiry,
+        put_debit_spread_pnl_at_expiry,
+    )
+    from audit_ledger.strategies.long_call import long_call_pnl_at_expiry
+    from audit_ledger.strategies.call_debit_spread import call_debit_spread_pnl_at_expiry
+
+    assert callable(long_put_pnl_at_expiry)
+    assert callable(long_call_pnl_at_expiry)
+    assert callable(bear_call_spread_pnl_at_expiry)
+    assert callable(put_debit_spread_pnl_at_expiry)
+    assert callable(call_debit_spread_pnl_at_expiry)
+
+
+def _assert_outcome_shape(result):
+    assert set(result) == {"pnl_dollars", "pnl_pct_bp", "outcome_class"}
+    assert isinstance(result["outcome_class"], str) and result["outcome_class"]
+
+
+def test_long_call_itm_is_a_win():
+    from audit_ledger.strategies.long_call import long_call_pnl_at_expiry
+    r = long_call_pnl_at_expiry(expiry_spot=110.0, strike=100.0, premium_paid=5.0)
+    _assert_outcome_shape(r)
+    assert r["pnl_dollars"] > 0  # 10 intrinsic - 5 premium, net positive
+
+
+def test_long_put_itm_is_a_win():
+    from audit_ledger.strategies.long_put import long_put_pnl_at_expiry
+    r = long_put_pnl_at_expiry(expiry_spot=90.0, strike=100.0, premium_paid=5.0)
+    _assert_outcome_shape(r)
+    assert r["pnl_dollars"] > 0
+
+
+def test_call_debit_spread_both_itm_is_a_win():
+    from audit_ledger.strategies.call_debit_spread import call_debit_spread_pnl_at_expiry
+    r = call_debit_spread_pnl_at_expiry(
+        expiry_spot=110.0, bought_strike=100.0, sold_strike=105.0, net_debit=2.0
+    )
+    _assert_outcome_shape(r)
+    assert r["pnl_dollars"] > 0  # 5 width - 2 debit
+
+
+def test_bear_call_spread_below_short_is_a_win():
+    from audit_ledger.strategies.bear_call_spread import bear_call_spread_pnl_at_expiry
+    r = bear_call_spread_pnl_at_expiry(
+        expiry_spot=90.0, short_strike=100.0, long_strike=105.0, net_credit=2.0
+    )
+    _assert_outcome_shape(r)
+    assert r["pnl_dollars"] > 0  # both legs expire worthless, keep the credit
+
+
+def test_put_debit_spread_below_sold_is_a_win():
+    from audit_ledger.strategies.put_debit_spread import put_debit_spread_pnl_at_expiry
+    r = put_debit_spread_pnl_at_expiry(
+        expiry_spot=90.0, bought_strike=100.0, sold_strike=95.0, net_debit=2.0
+    )
+    _assert_outcome_shape(r)
+    assert r["pnl_dollars"] > 0  # 5 width - 2 debit
+
+
+def test_strategy_data_unavailable_on_nonpositive_cost():
+    """A non-positive premium/debit/credit yields the data_unavailable class."""
+    from audit_ledger.strategies.long_call import long_call_pnl_at_expiry
+    r = long_call_pnl_at_expiry(expiry_spot=110.0, strike=100.0, premium_paid=0.0)
+    assert r["outcome_class"] == "data_unavailable"
+    assert r["pnl_dollars"] is None
+
+
+def test_outcome_for_structure_dispatch_is_in_package():
+    """The structure dispatcher lives in the package (no platform dependency)
+    and routes each discriminator to the right computer."""
+    import pytest
+
+    from audit_ledger.strategies.dispatch import outcome_for_structure
+
+    bull = outcome_for_structure(
+        "bull_put_spread", expiry_spot=110.0,
+        short_strike=100.0, long_strike=95.0, net_credit=1.5,
+    )
+    _assert_outcome_shape(bull)
+    # empty / None route to the bull-put computer (backward compat).
+    assert outcome_for_structure(
+        None, expiry_spot=110.0, short_strike=100.0, long_strike=95.0, net_credit=1.5,
+    ) == bull
+    # a directional structure routes correctly.
+    lc = outcome_for_structure("long_call", expiry_spot=110.0, strike=100.0, premium_paid=5.0)
+    assert lc["pnl_dollars"] > 0
+    # unknown discriminator fails loud.
+    with pytest.raises(ValueError):
+        outcome_for_structure("iron_condor", expiry_spot=100.0)

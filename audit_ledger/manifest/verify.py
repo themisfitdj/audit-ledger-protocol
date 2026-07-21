@@ -15,18 +15,32 @@ library can:
 Independence-of-AWS verification: steps 1 and 2 require ZERO AWS access.
 Step 3 is auditor-only.
 
-CLI lives in the adapter (e.g. brk-tasty's scripts/verify_ledger_manifest.py).
+CLI lives in the adapter (the platform provides its own verify entrypoint).
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
+
+
+# Symmetric with audit_ledger.manifest.build._is_date_prefixed.
+# The verifier's audit set must match the builder's set exactly, otherwise
+# non-date-prefixed test artifacts in the bucket would surface as false
+# orphans-in-S3.
+_DATE_SUBPATH = re.compile(r"\d{4}-\d{2}-\d{2}/.+")
+
+
+def _is_date_prefixed(key: str, prefix: str) -> bool:
+    if not key.startswith(prefix):
+        return False
+    return bool(_DATE_SUBPATH.match(key[len(prefix):]))
 
 
 @dataclass
@@ -127,12 +141,15 @@ def walk_chain(manifests: list[dict]) -> dict:
 
 
 def _list_s3_keys(s3_client, bucket: str, prefixes: list[str]) -> list[str]:
+    """Filter to date-prefixed keys symmetric with the builder so
+    non-date-prefixed test artifacts don't false-fire as orphans-in-S3."""
     keys: list[str] = []
     paginator = s3_client.get_paginator("list_objects_v2")
     for prefix in prefixes:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents") or []:
-                keys.append(obj["Key"])
+                if _is_date_prefixed(obj["Key"], prefix):
+                    keys.append(obj["Key"])
     return keys
 
 

@@ -1,22 +1,38 @@
 """Core dataclasses every adapter consumes.
 
 These shapes are the methodology's contract: changes here require a version
-bump and an adapter-compatibility note in the changelog. v0 of `Recommendation`
-is bull-put-spread-shaped; multi-strategy generalization (`structure`
-discriminator + `strategy_metadata` dict) is roadmap.
+bump and an adapter-compatibility note in the changelog. `Recommendation`
+carries a `structure_type` discriminator + a per-structure `strategy_metadata`
+dict, so all six BRK-124/126 structures (bull put / bear call spread, long put /
+long call, put / call debit spread) share one shape. The bull-put strike fields
+are retained (Optional) for backward compatibility with pre-discriminator
+recs; their removal is the v4.0 Phase 3 change, gated on the historical-ledger
+archive.
 """
 from __future__ import annotations
 
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
 class Recommendation:
     """A single ranked recommendation in a Run.
 
-    v0 is bull-put-spread-shaped. Multi-strategy generalization (structure
-    discriminator + strategy_metadata dict) is on the roadmap.
+    Multi-structure via the ``structure_type`` discriminator + a per-structure
+    ``strategy_metadata`` dict whose keys mirror the ledger ``suggested_strikes``
+    shapes:
+
+      * ``bull_put_spread`` / ``bear_call_spread``: ``{short, long, net_credit}``
+      * ``long_put`` / ``long_call``:               ``{long, premium}``
+      * ``put_debit_spread`` / ``call_debit_spread``: ``{bought, sold, net_debit}``
+
+    ``bp_required`` is generic across every structure. The bull-put strike
+    fields (``short_strike`` / ``long_strike`` / ``net_credit``) are Optional
+    and default to ``None`` so non-bull-put structures construct cleanly; they
+    are kept only for backward compatibility with pre-discriminator recs (whose
+    ``structure_type`` is absent / empty and whose P&L computes off these
+    fields). New structures leave them ``None`` and populate ``strategy_metadata``.
 
     Adapters parse their own ledger format and produce instances of this
     dataclass — the audit_ledger framework consumes only this shape.
@@ -26,11 +42,15 @@ class Recommendation:
     risk_flags: tuple[str, ...]
     ev_pct: float
     iv_rank: float
-    short_strike: float
-    long_strike: float
     expiry: datetime.date
-    net_credit: float
     bp_required: float
+    # Discriminator + per-structure params (keys mirror suggested_strikes shapes).
+    structure_type: str = "bull_put_spread"
+    strategy_metadata: dict = field(default_factory=dict)
+    # Bull-put backward-compat fields — Optional; unset for non-bull-put structures.
+    short_strike: float | None = None
+    long_strike: float | None = None
+    net_credit: float | None = None
 
 
 # Backwards-compatible alias for adapter authors migrating from brk-tasty's

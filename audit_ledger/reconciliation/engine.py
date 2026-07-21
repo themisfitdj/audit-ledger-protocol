@@ -18,13 +18,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import date
 from decimal import Decimal
 
 from audit_ledger.broker.types import (
     BrokerOrder,
     BrokerTransaction,
     parse_option_symbol,
+)
+from audit_ledger.match import (
+    DEFAULT_STRIKE_TOLERANCE,
+    match_structured_rec,
+    structure_leg_fields,
 )
 from audit_ledger.reconciliation.schema import (
     MatchStatus,
@@ -73,9 +77,33 @@ def _classify_structure(legs: list[ReconciledTradeLeg]) -> str:
 
 
 def _is_supported_v0(structure: str) -> bool:
-    """V0 computes P&L for bull_put_spread only. Other structures are recorded
-    as structure_unsupported with no P&L."""
+    """Whether v0 credit semantics (recommended_credit / actual_entry_credit /
+    exit_debit / slippage_vs_model) apply. Frozen to bull_put_spread — the only
+    credit structure for which those credit-named fields are meaningful.
+    Broadening realized P&L (BRK-157) does NOT change this set: debit/long
+    structures get realized_pnl_dollars but leave the credit-named fields None
+    so credit semantics are never forced onto a debit attribution."""
     return structure == Structure.BULL_PUT_SPREAD.value
+
+
+# BRK-157: structures for which realized P&L = sum(open_net_value) +
+# sum(close_net_value) across legs is a meaningful broker-truth number. The
+# net_value sign convention (credit +, debit -) makes the sum profit-positive
+# for credit AND debit/long structures alike, so it is structure-agnostic
+# across this set. Genuinely unpriceable topologies (iron_condor, strangle,
+# naked, equity, unknown) are excluded — they stay structure_unsupported.
+_PRICEABLE_STRUCTURES = frozenset({
+    Structure.BULL_PUT_SPREAD.value,
+    Structure.BEAR_CALL_SPREAD.value,
+    Structure.CALL_DEBIT_SPREAD.value,
+    Structure.PUT_DEBIT_SPREAD.value,
+    Structure.LONG_CALL.value,
+    Structure.LONG_PUT.value,
+})
+
+
+def _is_priceable(structure: str) -> bool:
+    return structure in _PRICEABLE_STRUCTURES
 
 
 def _make_leg_from_txs(
@@ -104,17 +132,48 @@ def _make_leg_from_txs(
     )
 
 
-def _rec_matches_structure(rec: dict, underlying: str, expiry: date, strikes: set[Decimal]) -> bool:
-    """Structure-based match: rec's suggested_strikes align with the trade's
-    underlying + expiry + strike set."""
-    if rec.get("symbol") != underlying:
-        return False
-    ss = rec.get("suggested_strikes") or {}
-    rec_expiry = ss.get("expiry")
-    if rec_expiry and str(rec_expiry) != expiry.isoformat():
-        return False
-    rec_strikes = {Decimal(str(ss.get("short", 0))), Decimal(str(ss.get("long", 0)))}
-    return rec_strikes == strikes
+# How each structure_type's canonical leg order maps onto broker-leg open
+# actions. For spreads the two legs are distinguished by their opening action:
+# a "Sell to Open" leg vs a "Buy to Open" leg. The tuple is the canonical leg
+# order (matching audit_ledger.match._STRUCTURE_LEG_FIELDS) expressed as the
+# open-action keyword each leg carries.
+#   bull_put / bear_call: (short=Sell, long=Buy)
+#   call_debit / put_debit: (bought=Buy, sold=Sell)
+#   long_call / long_put: (Buy,)
+_STRUCTURE_LEG_OPEN_SIDE: dict[str, tuple[str, ...]] = {
+    "bull_put_spread": ("Sell", "Buy"),
+    "bear_call_spread": ("Sell", "Buy"),
+    "call_debit_spread": ("Buy", "Sell"),
+    "put_debit_spread": ("Buy", "Sell"),
+    "long_call": ("Buy",),
+    "long_put": ("Buy",),
+}
+
+
+def _realized_strikes_for_structure(structure_type, legs) -> list[Decimal] | None:
+    """Order the trade's realized leg strikes into the structure's canonical
+    leg order (so per-leg deviation lines up with the rec's suggested strikes).
+
+    Returns None when the trade's legs don't fit the structure's leg count or
+    the legs lack the expected open-side actions / strikes."""
+    sides = _STRUCTURE_LEG_OPEN_SIDE.get(structure_type)
+    if sides is None:
+        return None
+    option_legs = [leg for leg in legs if leg.strike is not None]
+    if len(option_legs) != len(sides):
+        return None
+    ordered: list[Decimal] = []
+    remaining = list(option_legs)
+    for side in sides:
+        match = next(
+            (leg for leg in remaining if leg.action and side in leg.action),
+            None,
+        )
+        if match is None:
+            return None
+        ordered.append(match.strike)
+        remaining.remove(match)
+    return ordered
 
 
 def reconcile(
@@ -193,6 +252,11 @@ def reconcile(
         sum_fees = Decimal("0")
         any_open = False
         any_close = False
+        # BRK-157: realized P&L is a close-time quantity — only computed when
+        # EVERY opened leg has a corresponding close (trade close, expiration,
+        # assignment, or exercise). A leg opened with no close keeps the trade
+        # not-fully-closed and leaves realized_pnl_dollars None.
+        any_open_leg_unclosed = False
 
         for sym in leg_symbols:
             sym_txs = [t for t in txs if t.symbol == sym]
@@ -230,20 +294,62 @@ def reconcile(
                 any_close = True
             if realized_close_tx is not None:
                 any_close = True
+            # A leg that opened but has neither a trade-close nor a realized
+            # close (expiration/assignment/exercise) is still open.
+            if open_tx is not None and close_tx is None and realized_close_tx is None:
+                any_open_leg_unclosed = True
 
         structure = _classify_structure(legs)
         supported = _is_supported_v0(structure)
 
-        strikes_set = {leg.strike for leg in legs if leg.strike is not None}
+        # BRK-155: structure-aware, strike-tolerant attribution. Try every
+        # structure_type present among recs that share (symbol, expiry); for
+        # each, order this trade's realized strikes into that structure's
+        # canonical leg order and ask match.match_structured_rec for the
+        # nearest-strike rec. A fill attributes whenever ANY rec shares
+        # (symbol, expiry, structure_type) — operator-tweaked strikes still
+        # join (classified within_tolerance / loose_review, never dropped).
         matched_rec = None
-        if structure == Structure.BULL_PUT_SPREAD.value and any_open:
-            for rec in recs:
-                rid = rec.get("recommendation_id")
-                if rid and rid in used_rec_ids:
+        match_classification = None
+        strike_deviation = None
+        if any_open and expiry is not None:
+            expiry_iso = expiry.isoformat()
+            candidate_structs = {
+                rec.get("structure_type") or "bull_put_spread"
+                for rec in recs
+                if rec.get("symbol") == underlying
+                and str((rec.get("suggested_strikes") or {}).get("expiry") or expiry_iso)
+                == expiry_iso
+                and structure_leg_fields(rec.get("structure_type") or "bull_put_spread")
+                is not None
+            }
+            best = None  # (max_abs_dev, struct, StructuredMatch)
+            for cand in candidate_structs:
+                realized_strikes = _realized_strikes_for_structure(cand, legs)
+                if realized_strikes is None:
                     continue
-                if _rec_matches_structure(rec, underlying, expiry, strikes_set):
-                    matched_rec = rec
-                    break
+                sm = match_structured_rec(
+                    symbol=underlying, expiry=expiry, structure_type=cand,
+                    realized_strikes=realized_strikes, recs=recs,
+                    used_rec_ids=used_rec_ids,
+                    tolerance=DEFAULT_STRIKE_TOLERANCE,
+                )
+                if sm is None:
+                    continue
+                if best is None or sm.max_abs_deviation < best[0]:
+                    best = (sm.max_abs_deviation, cand, sm)
+            if best is not None:
+                _, matched_struct, sm = best
+                matched_rec = sm.rec
+                match_classification = sm.classification
+                strike_deviation = list(sm.per_leg_deviation)
+                # The rec's declared structure is ground truth for a matched
+                # fill (broker leg topology can't disambiguate call-debit from
+                # bear-call). Bull-put keeps its topology value so the v0 P&L
+                # path is byte-identical.
+                if matched_struct != Structure.BULL_PUT_SPREAD.value:
+                    structure = matched_struct
+                    supported = _is_supported_v0(structure)
 
         realized_pnl: Decimal | None = None
         actual_entry_credit: Decimal | None = None
@@ -251,21 +357,40 @@ def reconcile(
         slippage: Decimal | None = None
         recommended_credit: Decimal | None = None
 
+        # BRK-157: realized P&L = sum(open_net_value) + sum(close_net_value)
+        # across legs is broker-truth and structure-agnostic (net_value already
+        # encodes the credit/debit cash-flow sign AND the multiplier), so it is
+        # computed for every priceable structure — bull_put plus the ai-bif
+        # debit/long structures (call_debit, put_debit, long_call, long_put,
+        # bear_call) — but ONLY when the trade is fully closed. The bull_put
+        # arithmetic is unchanged: this is the same sum_open_nv + sum_close_nv
+        # (and the realized-close-only branch) the v0 path already used, so a
+        # bull_put's realized_pnl_dollars stays byte-identical.
+        fully_closed = any_open and not any_open_leg_unclosed
+        if _is_priceable(structure) and fully_closed:
+            if realized_closes and not closes_trade:
+                realized_pnl = sum_open_nv
+            else:
+                realized_pnl = sum_open_nv + sum_close_nv
+
+        # Credit-named fields (actual_entry_credit / exit_debit, and downstream
+        # recommended_credit / slippage_vs_model) carry credit semantics, so
+        # they stay scoped to the v0-supported credit structure (bull_put).
+        # Debit/long structures leave them None — BRK-157 does not force credit
+        # framing onto a debit attribution.
         if supported:
             mult = legs[0].multiplier if legs else 100
-            if any_open and (any_close or realized_closes):
-                if realized_closes and not closes_trade:
-                    realized_pnl = sum_open_nv
-                else:
-                    realized_pnl = sum_open_nv + sum_close_nv
             if any_open:
                 actual_entry_credit = (sum_open_nv / mult).quantize(Decimal("0.0001"))
             if any_close and not realized_closes:
                 exit_debit = (sum_close_nv / mult).quantize(Decimal("0.0001"))
 
-        if not supported:
-            match_status = MatchStatus.STRUCTURE_UNSUPPORTED.value
-        elif realized_closes:
+        # BRK-155: a matched rec attributes the fill regardless of whether v0
+        # computes P&L for its structure. structure_unsupported is reserved for
+        # UNMATCHED fills whose topology v0 can't price (iron condor, strangle,
+        # naked, equity). A matched ai-bif fill (no v0 P&L yet) still surfaces
+        # MATCHED/HELD_OPEN so the attribution isn't masked.
+        if realized_closes:
             sub = realized_closes[0].transaction_sub_type
             if sub in ("Expiration", "Cash Settled Expiration"):
                 match_status = MatchStatus.EXPIRED_WORTHLESS.value
@@ -277,6 +402,8 @@ def reconcile(
             match_status = MatchStatus.MATCHED.value
         elif matched_rec and any_open and not any_close:
             match_status = MatchStatus.HELD_OPEN.value
+        elif not supported:
+            match_status = MatchStatus.STRUCTURE_UNSUPPORTED.value
         else:
             match_status = MatchStatus.OFF_SYSTEM_FILL.value
 
@@ -315,6 +442,8 @@ def reconcile(
             match_status=match_status,
             roll_pair_id=None,
             exceptions=[],
+            match_classification=match_classification,
+            strike_deviation=strike_deviation,
         ))
 
     # Rolls — each emits two trades sharing a roll_pair_id
