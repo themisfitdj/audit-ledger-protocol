@@ -176,6 +176,22 @@ def _realized_strikes_for_structure(structure_type, legs) -> list[Decimal] | Non
     return ordered
 
 
+_STRUCTURE_VALUES = frozenset(s.value for s in Structure)
+
+
+def _not_taken_structure(rec: dict) -> str:
+    """Structure of a recommendation that never traded.
+
+    Read from the rec's own ``structure_type``, with the same legacy default as
+    the matched branch (a rec written before ``structure_type`` existed is a
+    bull put spread). An unrecognised value is ``unknown``, never a guess.
+    """
+    st = rec.get("structure_type")
+    if st is None or st == "":
+        return Structure.BULL_PUT_SPREAD.value
+    return st if isinstance(st, str) and st in _STRUCTURE_VALUES else Structure.UNKNOWN.value
+
+
 def reconcile(
     recs: list[dict],
     orders: list[BrokerOrder],
@@ -532,7 +548,7 @@ def reconcile(
             thesis_version=rec.get("thesis_version"),
             origin=Origin.PROGRAM.value,
             symbol=rec.get("symbol", ""),
-            structure=Structure.BULL_PUT_SPREAD.value,
+            structure=_not_taken_structure(rec),
             legs=[],
             recommended_credit=Decimal(str((rec.get("suggested_strikes") or {}).get("net_credit", 0)))
                               if (rec.get("suggested_strikes") or {}).get("net_credit") is not None else None,
