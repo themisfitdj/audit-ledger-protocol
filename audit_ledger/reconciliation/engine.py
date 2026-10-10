@@ -113,22 +113,38 @@ def _make_leg_from_txs(
     open_tx: BrokerTransaction | None,
     close_tx: BrokerTransaction | None,
 ) -> ReconciledTradeLeg:
+    return _make_leg(symbol, instrument_type, multiplier,
+                     [open_tx] if open_tx else [], [close_tx] if close_tx else [])
+
+
+def _make_leg(
+    symbol: str,
+    instrument_type: str,
+    multiplier: int,
+    open_txs: list[BrokerTransaction],
+    close_txs: list[BrokerTransaction],
+) -> ReconciledTradeLeg:
+    """One leg from EVERY fill on it (v0.2.2). A leg opened or closed across
+    several orders carries the summed quantity and net values; the single-id
+    fields keep the first transaction, and every id is on the trade's
+    ``transaction_ids``."""
     parsed = parse_option_symbol(symbol)
-    action = (open_tx or close_tx).action if (open_tx or close_tx) else ""
-    quantity = (open_tx or close_tx).quantity if (open_tx or close_tx) else Decimal("0")
+    first = (open_txs or close_txs or [None])[0]
+    action = first.action if first else ""
+    quantity = sum((t.quantity or Decimal("0") for t in (open_txs or close_txs)), Decimal("0"))
     return ReconciledTradeLeg(
         symbol=symbol,
         instrument_type=instrument_type,
         action=action or "",
-        quantity=quantity or Decimal("0"),
+        quantity=quantity,
         strike=parsed["strike"] if parsed else None,
         expiry=parsed["expiry"] if parsed else None,
         option_type=parsed["option_type"] if parsed else None,
         multiplier=multiplier,
-        open_net_value=open_tx.net_value if open_tx else None,
-        close_net_value=close_tx.net_value if close_tx else None,
-        open_tx_id=open_tx.id if open_tx else None,
-        close_tx_id=close_tx.id if close_tx else None,
+        open_net_value=sum((t.net_value for t in open_txs), Decimal("0")) if open_txs else None,
+        close_net_value=sum((t.net_value for t in close_txs), Decimal("0")) if close_txs else None,
+        open_tx_id=open_txs[0].id if open_txs else None,
+        close_tx_id=close_txs[0].id if close_txs else None,
     )
 
 
@@ -273,26 +289,27 @@ def reconcile(
         # assignment, or exercise). A leg opened with no close keeps the trade
         # not-fully-closed and leaves realized_pnl_dollars None.
         any_open_leg_unclosed = False
+        exceptions: list[dict] = []
+
+        # v0.2.2: realized P&L needs EVERY fill on a leg and an exact quantity
+        # tie. A leg whose closed quantity differs from its opened quantity
+        # (a partial close, or a close of lots opened before the window) is
+        # not realized and is flagged, never priced on a partial view.
+        quantity_mismatch = False
 
         for sym in leg_symbols:
             sym_txs = [t for t in txs if t.symbol == sym]
-            open_tx = next((t for t in sym_txs if t.action and "Open" in t.action), None)
-            close_tx = next((t for t in sym_txs if t.action and "Close" in t.action), None)
-            realized_close_tx = next(
-                (t for t in sym_txs if t.transaction_sub_type in (
-                    "Expiration", "Cash Settled Expiration",
-                    "Assignment", "Cash Settled Assignment",
-                    "Exercise",
-                )),
-                None,
-            )
+            open_txs = [t for t in sym_txs if t.action and "Open" in t.action]
+            close_txs = [t for t in sym_txs if t.action and "Close" in t.action]
+            realized_close_txs_leg = [t for t in sym_txs if t.transaction_sub_type in (
+                "Expiration", "Cash Settled Expiration",
+                "Assignment", "Cash Settled Assignment",
+                "Exercise",
+            )]
             inst_type = next((t.instrument_type for t in sym_txs if t.instrument_type), "")
             multiplier = _MULTIPLIER_DEFAULTS.get(inst_type, 100)
-            effective_close = close_tx or realized_close_tx
-            leg = _make_leg_from_txs(
-                symbol=sym, instrument_type=inst_type, multiplier=multiplier,
-                open_tx=open_tx, close_tx=effective_close,
-            )
+            effective_close = close_txs or realized_close_txs_leg
+            leg = _make_leg(sym, inst_type, multiplier, open_txs, effective_close)
             legs.append(leg)
             for t in sym_txs:
                 tx_ids.append(t.id)
@@ -302,18 +319,32 @@ def reconcile(
                     t.commission + t.clearing_fees + t.regulatory_fees
                     + t.proprietary_index_option_fees
                 )
-            if open_tx is not None:
-                sum_open_nv += open_tx.net_value
+            if open_txs:
+                sum_open_nv += sum((t.net_value for t in open_txs), Decimal("0"))
                 any_open = True
-            if close_tx is not None:
-                sum_close_nv += close_tx.net_value
+            if close_txs:
+                sum_close_nv += sum((t.net_value for t in close_txs), Decimal("0"))
                 any_close = True
-            if realized_close_tx is not None:
+            if realized_close_txs_leg:
                 any_close = True
             # A leg that opened but has neither a trade-close nor a realized
             # close (expiration/assignment/exercise) is still open.
-            if open_tx is not None and close_tx is None and realized_close_tx is None:
+            if open_txs and not close_txs and not realized_close_txs_leg:
                 any_open_leg_unclosed = True
+            elif open_txs:
+                opened_qty = sum((abs(t.quantity or 0) for t in open_txs), Decimal("0"))
+                closing = {t.id: t for t in close_txs + realized_close_txs_leg}
+                closed_qty = sum((abs(t.quantity or 0) for t in closing.values()), Decimal("0"))
+                if closed_qty != opened_qty:
+                    quantity_mismatch = True
+                    exceptions.append({
+                        "type": "quantity_mismatch",
+                        "message": (f"{sym}: closed {closed_qty} of {opened_qty} opened; "
+                                    "realized P&L withheld"),
+                        "symbol": sym,
+                        "opened_quantity": str(opened_qty.normalize()),
+                        "closed_quantity": str(closed_qty.normalize()),
+                    })
 
         structure = _classify_structure(legs)
         supported = _is_supported_v0(structure)
@@ -382,7 +413,12 @@ def reconcile(
         # arithmetic is unchanged: this is the same sum_open_nv + sum_close_nv
         # (and the realized-close-only branch) the v0 path already used, so a
         # bull_put's realized_pnl_dollars stays byte-identical.
-        fully_closed = any_open and not any_open_leg_unclosed
+        fully_closed = any_open and not any_open_leg_unclosed and not quantity_mismatch
+        if quantity_mismatch:
+            # Not closed for status or exit fields either: a MATCHED row with
+            # no P&L reads as finished and is silently skipped downstream.
+            any_close = False
+            realized_closes = []
         if _is_priceable(structure) and fully_closed:
             if realized_closes and not closes_trade:
                 realized_pnl = sum_open_nv
@@ -457,7 +493,7 @@ def reconcile(
             transaction_ids=tx_ids,
             match_status=match_status,
             roll_pair_id=None,
-            exceptions=[],
+            exceptions=exceptions,
             match_classification=match_classification,
             strike_deviation=strike_deviation,
         ))
